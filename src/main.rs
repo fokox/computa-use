@@ -336,7 +336,7 @@ fn handle_tool_call(enigo: &mut Enigo, name: &str, args: Value, session_dir: &st
             image.save(&file_path).map_err(|e| anyhow::anyhow!("Save error: {}", e))?;
             
             let mut buffer = Cursor::new(Vec::new());
-            image.write_to(&mut buffer, image::ImageOutputFormat::Png).map_err(|e| anyhow::anyhow!("Encode error: {}", e))?;
+            image.write_to(&mut buffer, image::ImageFormat::Png).map_err(|e| anyhow::anyhow!("Encode error: {}", e))?;
             let base64_data = encode_base64(&buffer.into_inner());
 
             text = format!("Saved screenshot to {}", file_path);
