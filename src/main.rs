@@ -8,12 +8,44 @@ use enigo::{Enigo, Keyboard, Mouse, Coordinate, Button, Direction, Key, Settings
 use uiautomation::{UIAutomation, UIElement};
 use xcap::Monitor;
 use image::GenericImageView;
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::fs;
+use std::io::Cursor;
+
+const BASE64_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+fn encode_base64(input: &[u8]) -> String {
+    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    let mut i = 0;
+    while i < input.len() {
+        let b1 = input[i];
+        let b2 = if i + 1 < input.len() { input[i + 1] } else { 0 };
+        let b3 = if i + 2 < input.len() { input[i + 2] } else { 0 };
+        
+        let out1 = b1 >> 2;
+        let out2 = ((b1 & 0b00000011) << 4) | (b2 >> 4);
+        let out3 = ((b2 & 0b00001111) << 2) | (b3 >> 6);
+        let out4 = b3 & 0b00111111;
+        
+        out.push(BASE64_CHARS[out1 as usize] as char);
+        out.push(BASE64_CHARS[out2 as usize] as char);
+        out.push(if i + 1 < input.len() { BASE64_CHARS[out3 as usize] as char } else { '=' });
+        out.push(if i + 2 < input.len() { BASE64_CHARS[out4 as usize] as char } else { '=' });
+        
+        i += 3;
+    }
+    out
+}
+
 fn main() -> Result<()> {
+    // Generate session directory
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let session_dir = format!("sessions/session_{}", now);
+    fs::create_dir_all(&session_dir)?;
+
     // We use a synchronous loop for stdio reading to be simple and lightweight.
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut enigo = Enigo::new(&Settings::default()).unwrap();
-
 
     for line in stdin.lock().lines() {
         let line = line?;
@@ -130,6 +162,40 @@ fn main() -> Result<()> {
                                     },
                                     "required": ["template_path"]
                                 }
+                            },
+                            {
+                                "name": "take_screenshot",
+                                "description": "Captures the entire screen, saves it to a session-specific folder, and returns the image data directly.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {},
+                                    "required": []
+                                }
+                            },
+                            {
+                                "name": "perform_actions",
+                                "description": "Perform multiple computer navigation actions sequentially in one call. Actions can be mouse_move (x, y), mouse_click (button), keyboard_type (text), keyboard_press (key).",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "actions": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "action": { "type": "string", "description": "One of: mouse_move, mouse_click, keyboard_type, keyboard_press" },
+                                                    "x": { "type": "integer" },
+                                                    "y": { "type": "integer" },
+                                                    "button": { "type": "string" },
+                                                    "text": { "type": "string" },
+                                                    "key": { "type": "string" }
+                                                },
+                                                "required": ["action"]
+                                            }
+                                        }
+                                    },
+                                    "required": ["actions"]
+                                }
                             }
                         ]
                     }));
@@ -139,7 +205,7 @@ fn main() -> Result<()> {
                     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     let args = params.get("arguments").cloned().unwrap_or(Value::Null);
 
-                    let result = handle_tool_call(&mut enigo, tool_name, args);
+                    let result = handle_tool_call(&mut enigo, tool_name, args, &session_dir);
                     match result {
                         Ok(res) => response.result = Some(json!(res)),
                         Err(e) => {
@@ -172,9 +238,10 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn handle_tool_call(enigo: &mut Enigo, name: &str, args: Value) -> Result<CallToolResult> {
+fn handle_tool_call(enigo: &mut Enigo, name: &str, args: Value, session_dir: &str) -> Result<CallToolResult> {
     let mut is_error = false;
     let mut text = String::new();
+    let mut extra_content = Vec::new();
 
     match name {
         "execute_command" => {
@@ -259,14 +326,98 @@ fn handle_tool_call(enigo: &mut Enigo, name: &str, args: Value) -> Result<CallTo
                 }
             };
         }
+        "take_screenshot" => {
+            let monitors = Monitor::all().map_err(|e| anyhow::anyhow!("Monitor error: {}", e))?;
+            let monitor = monitors.first().ok_or_else(|| anyhow::anyhow!("No monitor found"))?;
+            let image = monitor.capture_image().map_err(|e| anyhow::anyhow!("Capture error: {}", e))?;
+            
+            let file_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+            let file_path = format!("{}/screenshot_{}.png", session_dir, file_time);
+            image.save(&file_path).map_err(|e| anyhow::anyhow!("Save error: {}", e))?;
+            
+            let mut buffer = Cursor::new(Vec::new());
+            image.write_to(&mut buffer, image::ImageOutputFormat::Png).map_err(|e| anyhow::anyhow!("Encode error: {}", e))?;
+            let base64_data = encode_base64(&buffer.into_inner());
+
+            text = format!("Saved screenshot to {}", file_path);
+            extra_content.push(CallToolResultContent::Image { data: base64_data, mimeType: "image/png".to_string() });
+        }
+        "perform_actions" => {
+            let mut results = Vec::new();
+            if let Some(actions) = args.get("actions").and_then(|v| v.as_array()) {
+                for act in actions {
+                    let act_type = act.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                    match act_type {
+                        "mouse_move" => {
+                            let x = act.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                            let y = act.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                            if let Err(e) = enigo.move_mouse(x, y, Coordinate::Abs) {
+                                results.push(format!("Error mouse_move: {}", e));
+                            } else {
+                                results.push(format!("mouse_move({}, {})", x, y));
+                            }
+                        }
+                        "mouse_click" => {
+                            let btn_str = act.get("button").and_then(|v| v.as_str()).unwrap_or("left");
+                            let btn = match btn_str {
+                                "right" => Button::Right,
+                                "middle" => Button::Middle,
+                                _ => Button::Left,
+                            };
+                            if let Err(e) = enigo.button(btn, Direction::Click) {
+                                results.push(format!("Error mouse_click: {}", e));
+                            } else {
+                                results.push(format!("mouse_click({})", btn_str));
+                            }
+                        }
+                        "keyboard_type" => {
+                            let text_to_type = act.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                            if let Err(e) = enigo.text(text_to_type) {
+                                results.push(format!("Error keyboard_type: {}", e));
+                            } else {
+                                results.push(format!("keyboard_type(\"{}\")", text_to_type));
+                            }
+                        }
+                        "keyboard_press" => {
+                            let key_str = act.get("key").and_then(|v| v.as_str()).unwrap_or("");
+                            let key = match key_str {
+                                "return" => Key::Return,
+                                "space" => Key::Space,
+                                "escape" => Key::Escape,
+                                "backspace" => Key::Backspace,
+                                "tab" => Key::Tab,
+                                "media_play_pause" => Key::MediaPlayPause,
+                                "media_next_track" => Key::MediaNextTrack,
+                                _ => Key::Return, // Default fallback
+                            };
+                            if let Err(e) = enigo.key(key, Direction::Click) {
+                                results.push(format!("Error keyboard_press: {}", e));
+                            } else {
+                                results.push(format!("keyboard_press({})", key_str));
+                            }
+                        }
+                        _ => {
+                            results.push(format!("Unknown action: {}", act_type));
+                        }
+                    }
+                }
+                text = results.join("\n");
+            } else {
+                is_error = true;
+                text = "Missing or invalid 'actions' array".to_string();
+            }
+        }
         _ => {
             is_error = true;
             text = format!("Tool {} not found", name);
         }
     }
 
+    let mut content = vec![CallToolResultContent::Text { text }];
+    content.extend(extra_content);
+
     Ok(CallToolResult {
-        content: vec![CallToolResultContent::Text { text }],
+        content,
         isError: is_error,
     })
 }
